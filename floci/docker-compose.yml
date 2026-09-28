@@ -1,0 +1,16 @@
+services:
+  floci:
+    image: floci/floci:latest
+    container_name: floci
+    ports:
+      - "4566:4566"
+      - "2200-2299:2200-2299"
+      - "9169:9169"
+    environment:
+      FLOCI_SERVICES_EC2_ENABLED: "true"
+      FLOCI_SERVICES_EC2_MOCK: "${FLOCI_EC2_MOCK:-false}"
+      FLOCI_SERVICES_EC2_SSH_PORT_RANGE_START: "2200"
+      FLOCI_SERVICES_EC2_SSH_PORT_RANGE_END: "2299"
+    volumes:
+      - ./data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock

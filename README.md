@@ -6,6 +6,8 @@ Terraform y configurarlo con un playbook de Ansible.
 - **Requisito principal:** escribir código Terraform que cree un Droplet en DigitalOcean con IP
   pública y acceso por SSH usando una clave privada.
 - **Stretch goal:** playbook de Ansible que configure ese servidor.
+- **Anexo A (opcional):** replicar la misma IaC contra AWS emulado con
+  [Floci](https://floci.io), gratis y en local.
 
 > Recordatorio: DigitalOcean cobra por Droplet activo. Cuando termines la práctica, ejecuta
 > `terraform destroy` (paso 10) para dejar de pagar.
@@ -170,6 +172,13 @@ IaC-on-DigitalOcean/
 │   ├── variables.tf                # variables de entrada
 │   ├── outputs.tf                  # IP, comando ssh, línea de inventario
 │   └── terraform.tfvars.example    # plantilla de valores
+├── terraform-floci/                # la misma IaC contra AWS emulado (opcional, Anexo A)
+│   ├── provider.tf                 # provider aws apuntando a Floci
+│   ├── main.tf                     # S3, SQS, DynamoDB, SSM, IAM y EC2 emulados
+│   ├── variables.tf
+│   └── outputs.tf
+├── floci/
+│   └── docker-compose.yml          # emulador local de AWS
 ├── ansible/
 │   ├── ansible.cfg
 │   ├── inventory.ini
@@ -436,39 +445,234 @@ y te den feedback.
 
 ---
 
-## Anexo A: ¿Y en AWS o con Floci?
+## Anexo A: la misma IaC contra AWS local con Floci
 
-El enunciado menciona que la servidor Linux previo puede vivir en AWS u otro proveedor, pero el
-requisito de este proyecto es **DigitalOcean**: el provider `digitalocean` habla únicamente con la
-API de DigitalOcean, así que no se puede desplegar este Droplet en AWS.
+> Este anexo es **opcional**: el requisito del reto es DigitalOcean. Pero sirve para practicar
+> Terraform + Ansible contra la API de AWS **sin cuenta y sin gastar un céntimo**, y para entender
+> cómo cambia una misma IaC al cambiar de proveedor.
 
-- **AWS:** el mismo HCL con `aws_instance` sigue el mismo flujo (`init`/`plan`/`apply`) cambiando
-  el provider, el recurso y las credenciales (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
-  región). La estructura del proyecto, el versionado y el flujo de trabajo son idénticos.
-- **Floci** (<https://floci.io>) es un emulador local de servicios de AWS, compatible con el
-  formato de endpoints de LocalStack. Sirve para practicar Terraform contra una emulación de AWS
-  **sin gastar crédito y sin salir de tu máquina**, pero **no emula la API de DigitalOcean**, así
-  que no sirve para este proyecto:
+### A.0 Qué es Floci y qué puede y qué no puede hacer
 
-  ```bash
-  mkdir floci && cd floci
-  cat > compose.yaml <<'EOF'
-  services:
-    floci:
-      image: floci/floci:latest
-      ports:
-        - "4566:4566"
-      volumes:
-        - ./data:/app/data
-  EOF
-  docker compose up -d
+[Floci](https://floci.io) es un emulador local de servicios de AWS (compatible con el formato de
+endpoints de LocalStack). Levanta un endpoint único en `http://localhost:4566` y guarda el estado
+en un directorio local, así que todo lo que crees ahí desaparece con `docker compose down -v`.
 
-  export AWS_ENDPOINT_URL=http://localhost:4566
-  aws sts get-caller-identity --endpoint-url $AWS_ENDPOINT_URL
-  ```
+| | DigitalOcean (este repo) | Floci (este anexo) |
+|---|---|---|
+| Coste | Se paga mientras el Droplet exista | Gratis, 100 % local |
+| Provider de Terraform | `digitalocean/digitalocean` | `hashicorp/aws` con endpoints custom |
+| Autenticación | `DIGITALOCEAN_TOKEN` real | Credenciales falsas (`test`/`test`) |
+| Ansible por SSH | Sí, Droplet real con Ubuntu | **No en modo mock**: emulación sin sistema operativo |
+| `terraform destroy` | Apaga y borra la máquina | Borra el estado emulado |
 
-  Con `AWS_ENDPOINT_URL` apuntando a Floci, los recursos de AWS del provider `aws` se crean
-  contra el emulador local, y ahí sí puedes practicar recursos tipo `aws_s3_bucket`.
+Punto clave: el provider `digitalocean` **solo** habla con la API de DigitalOcean, así que este
+Droplet no se puede desplegar en Floci. Lo que se replica en Floci es la **misma metodología**
+(provider → variables → plan → apply → destroy) con recursos `aws_*`.
+
+### A.1 Levantar Floci
+
+Necesitas Docker y Docker Compose. Ya tienes el `docker-compose.yml` listo en `floci/`:
+
+```bash
+cd floci
+docker compose up -d
+docker compose logs -f floci     # sigue el arranque
+```
+
+Qué hace el compose de este repo:
+
+- publica `4566` (todas las llamadas a la API de AWS),
+- publica `2200-2299` (rango de puertos SSH de las instancias EC2 emuladas),
+- publica `9169` (Instance Metadata Service, IMDS),
+- monta `./data` (persistencia local) y `/var/run/docker.sock` (para los servicios que sí corren
+  en contenedores reales: Lambda, RDS, ElastiCache...).
+
+Comprueba que responde:
+
+```bash
+export AWS_ENDPOINT_URL=http://localhost:4566
+aws sts get-caller-identity --endpoint-url $AWS_ENDPOINT_URL
+```
+
+### A.2 Terraform contra Floci
+
+```bash
+cd ../terraform-floci
+
+terraform init          # descarga hashicorp/aws
+terraform fmt -check
+terraform validate
+terraform plan -out=floci.tfplan
+terraform apply floci.tfplan
+```
+
+`terraform-floci/provider.tf` es la pieza clave. Los emuladores no implementan la verificación
+real de credenciales ni el IMDS de AWS, así que hay que desactivarlas:
+
+```hcl
+provider "aws" {
+  region     = "us-east-1"
+  access_key = "test"
+  secret_key = "test"
+
+  skip_credentials_validation = true   # no hay STS real contra el emulador
+  skip_metadata_api_check     = true   # no consultes el IMDS de mi máquina
+  skip_requesting_account_id  = true   # no hace falta un account id real
+  s3_use_path_style           = true   # S3 con path-style, no virtual-host
+
+  endpoints {                          # cada servicio usado necesita su endpoint
+    dynamodb = "http://localhost:4566"
+    ec2      = "http://localhost:4566"
+    iam      = "http://localhost:4566"
+    s3       = "http://localhost:4566"
+    sqs      = "http://localhost:4566"
+    ssm      = "http://localhost:4566"
+    sts      = "http://localhost:4566"
+  }
+}
+```
+
+> **El endpoint se declara servicio a servicio**: si añades un recurso y olvidas su `endpoints`,
+> Terraform intentará hablar con la API real de AWS y fallará. Alternativa equivalente:
+> `export AWS_ENDPOINT_URL=http://localhost:4566` (o `AWS_ENDPOINT_URL_S3`, etc.).
+
+Qué crea `terraform-floci/main.tf`: un bucket S3 con bloqueo de acceso público, una cola SQS, una
+tabla DynamoDB (`PAY_PER_REQUEST`), un parámetro de SSM, un rol IAM con una política adjunta y,
+opcionalmente, una instancia EC2.
+
+### A.3 Verificar y limpiar
+
+```bash
+# Ver los recursos emulados con el AWS CLI
+aws --endpoint-url $AWS_ENDPOINT_URL s3api head-bucket --bucket floci-terraform-example
+aws --endpoint-url $AWS_ENDPOINT_URL sqs list-queues
+aws --endpoint-url $AWS_ENDPOINT_URL dynamodb list-tables
+aws --endpoint-url $AWS_ENDPOINT_URL ssm get-parameter --name /floci/environment
+
+# Lo mismo desde Terraform
+terraform output
+
+# Limpiar
+terraform destroy
+cd ../floci && docker compose down -v
+```
+
+### A.4 Estado remoto emulado (S3 backend + lock en DynamoDB)
+
+Con backend local el estado vive en tu disco. Para practicar el flujo real de equipo
+(estado compartido + bloqueo), Floci también emula el backend S3 con lock en DynamoDB:
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket                      = "tfstate"
+    key                         = "terraform.tfstate"
+    region                      = "us-east-1"
+    endpoint                    = "http://localhost:4566"
+    dynamodb_endpoint           = "http://localhost:4566"
+    dynamodb_table              = "tflock"
+    access_key                  = "test"
+    secret_key                  = "test"
+    skip_credentials_validation = true
+    skip_region_validation      = true
+    use_path_style              = true
+  }
+}
+```
+
+Los recursos del backend se crean **antes** del `init`:
+
+```bash
+aws --endpoint-url $AWS_ENDPOINT_URL s3api create-bucket --bucket tfstate
+aws --endpoint-url $AWS_ENDPOINT_URL dynamodb create-table \
+  --table-name tflock \
+  --attribute-definitions AttributeName=LockID,AttributeType=S \
+  --key-schema AttributeName=LockID,KeyType=HASH \
+  --billing-mode PAY_PER_REQUEST
+
+terraform init   # ahora migrará el estado local al bucket emulado
+```
+
+Advertencia útil: el estado **sigue siendo el estado de tu infraestructura emulada**, no de AWS
+real. No confundas `terraform destroy` sobre Floci con borrar algo en producción.
+
+### A.5 EC2 en Floci: mock vs. Docker
+
+`main.tf` incluye la instancia EC2, pero desactivada por defecto:
+
+```bash
+# 1) Descubre los AMI del catálogo emulado
+aws --endpoint-url $AWS_ENDPOINT_URL ec2 describe-images \
+  --query 'Images[].[ImageId,Name]' --output table
+
+# 2) Aplica con la instancia activada
+terraform apply -var create_instance=true -var instance_ami=ami-xxxxxxxx
+```
+
+Dos modos, controlables por variable de entorno:
+
+| Modo | Variable | Qué hace | ¿Ansible por SSH? |
+|------|----------|----------|--------------------|
+| Mock | `FLOCI_SERVICES_EC2_MOCK=true` | Registra la instancia en el estado, **no lanza contenedores** | No: no hay sistema operativo |
+| Docker | `FLOCI_SERVICES_EC2_MOCK=false` (por defecto) | Levanta un contenedor por instancia y publica sus puertos | Solo si el catálogo arranca `sshd` y la clave es válida |
+
+```bash
+cd floci
+FLOCI_EC2_MOCK=true docker compose up -d      # modo CI, instantáneo y sin Docker anidado
+docker compose logs floci | grep "Published EC2"
+# Published EC2 instance i-0abc... app port 22 on host port 2200 (socat -> 172.17.0.3:22)
+```
+
+En modo Docker, Floci publica el puerto SSH de cada instancia en el host dentro del rango
+2200-2299 usando sidecars de `socat`: es la forma de alcanzar "la instancia" desde tu máquina.
+El userland es el de la imagen del catálogo de Floci, no el de un Ubuntu completo de AWS, así que
+**no esperes un `apt` disponible ni un Droplet equivalente**.
+
+### A.6 Ansible en el mundo Floci
+
+Aquí conviene ser honesto sobre los límites de la emulación: **Floci emula APIs, no máquinas
+Linux**. Por eso hay tres formas de practicar la parte de Ansible, de más útil a menos:
+
+1. **La real (recomendada):** el playbook de este repo, `ansible/site.yml`, contra el Droplet del
+   paso 9. Es el flujo del enunciado: Terraform crea la máquina y Ansible la configura.
+2. **Con una VM local:** levanta una VM (Vagrant, Multipass, libvirt, Docker) y apunta el
+   inventario a ella. El mismo `site.yml` funciona tal cual, sin tocar el código del playbook:
+
+   ```ini
+   [droplets]
+   web-1 ansible_host=192.168.56.10 ansible_user=ubuntu
+   ```
+
+   ```bash
+   cd ansible && ansible-playbook site.yml
+   ```
+
+3. **Sin máquina, para iterar la lógica del playbook:** `--check` contra `localhost`, que valida
+   sintaxis, variables y permisos sin tocar nada. Es el equivalente local de lo que hace el modo
+   mock en Floci para Terraform:
+
+   ```bash
+   cd ansible
+   ansible-playbook site.yml --check --diff \
+     -i 'localhost,' -c local -e admin_user=admin
+   ```
+
+   Ansible contra la API emulada (crear el bucket, subir un `index.html` con `s3_sync` o
+   `amazon.aws.s3`) es posible, pero ya no es "configurar un servidor": es un playbook de
+   gestión de recursos. Trátalo como un ejercicio aparte, no como el stretch goal del reto.
+
+Resumen: **Terraform → Floci es totalmente soportado y recomendado; Ansible → Floci solo de
+forma indirecta**, porque necesita un sistema operativo detrás.
+
+### A.7 Volver al laboratorio de DigitalOcean
+
+Los dos worlds son independientes (carpetas y estados separados). Cuando termines Floci:
+
+```bash
+cd floci && docker compose down -v     # borra la emulación y su estado
+```
+
+y el laboratorio de DigitalOcean sigue intacto en `terraform/` y `ansible/`.
 
 ---
 
@@ -495,4 +699,12 @@ ansible-inventory --graph
 ansible droplets -m ping -vvv
 ansible-playbook site.yml --check --diff
 ansible-playbook site.yml --syntax-check
+
+# Floci / AWS local
+docker compose -f floci/docker-compose.yml up -d        # levanta el emulador
+docker compose -f floci/docker-compose.yml logs -f       # sigue el arranque
+docker compose -f floci/docker-compose.yml down -v      # apaga y borra el estado
+aws --endpoint-url $AWS_ENDPOINT_URL s3 ls
+aws --endpoint-url $AWS_ENDPOINT_URL ec2 describe-instances
+aws --endpoint-url $AWS_ENDPOINT_URL ec2 describe-images
 ```

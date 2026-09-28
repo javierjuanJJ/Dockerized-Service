@@ -7,6 +7,7 @@ crash.log
 
 ansible/ansible.log
 ansible/*.retry
+floci/data/
 .vscode/
 .idea/
 opencode.json
