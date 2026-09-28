@@ -1,0 +1,122 @@
+- name: Configurar el Droplet creado con Terraform
+  hosts: droplets
+  become: true
+  gather_facts: true
+
+  vars:
+    admin_user: admin
+    packages:
+      - nginx
+      - ufw
+      - curl
+      - unattended-upgrades
+      - chrony
+    sshd_config_dropin: /etc/ssh/sshd_config.d/99-hardening.conf
+    index_page_path: /var/www/html/index.html
+
+  tasks:
+    - name: Actualizar la cache de paquetes
+      ansible.builtin.apt:
+        update_cache: true
+        cache_valid_time: 3600
+
+    - name: Instalar paquetes base
+      ansible.builtin.apt:
+        name: "{{ packages }}"
+        state: present
+
+    - name: Aplicar actualizaciones de seguridad pendientes
+      ansible.builtin.apt:
+        name: "{{ packages }}"
+        state: latest
+        upgrade: safe
+      when: upgrade_packages | default(false) | bool
+
+    - name: Sincronizar la hora del servidor
+      ansible.builtin.service:
+        name: chrony
+        state: started
+        enabled: true
+
+    - name: Crear el usuario administrador
+      ansible.builtin.user:
+        name: "{{ admin_user }}"
+        groups: sudo
+        shell: /bin/bash
+        append: true
+        state: present
+
+    - name: Permitir acceso sin contrasena al usuario administrador
+      ansible.builtin.copy:
+        dest: /etc/sudoers.d/{{ admin_user }}
+        content: "{{ admin_user }} ALL=(ALL) NOPASSWD:ALL\n"
+        owner: root
+        group: root
+        mode: "0440"
+      notify: Restart sshd
+
+    - name: Instalar la clave publica en el usuario administrador
+      ansible.builtin.copy:
+        dest: "/home/{{ admin_user }}/.ssh/authorized_keys"
+        content: "{{ admin_ssh_public_key }}\n"
+        owner: "{{ admin_user }}"
+        group: "{{ admin_user }}"
+        mode: "0600"
+      when: admin_ssh_public_key is defined and admin_ssh_public_key | length > 0
+
+    - name: Endurecer la configuracion de SSH
+      ansible.builtin.copy:
+        dest: "{{ sshd_config_dropin }}"
+        content: |
+          PermitRootLogin prohibit-password
+          PasswordAuthentication no
+          PubkeyAuthentication yes
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart sshd
+
+    - name: Permitir SSH, HTTP y HTTPS en el firewall
+      community.general.ufw:
+        rule: allow
+        name: "{{ item }}"
+      loop:
+        - OpenSSH
+        - Nginx Full
+
+    - name: Activar el firewall
+      community.general.ufw:
+        state: enabled
+
+    - name: Desplegar la pagina por defecto
+      ansible.builtin.copy:
+        dest: "{{ index_page_path }}"
+        content: |
+          <!doctype html>
+          <html lang="es">
+            <head><meta charset="utf-8"><title>IaC en DigitalOcean</title></head>
+            <body>
+              <h1>Droplet desplegado con Terraform y configurado con Ansible</h1>
+              <p>Host: {{ inventory_hostname }} | Ansible user: {{ ansible_user }}</p>
+            </body>
+          </html>
+        owner: root
+        group: root
+        mode: "0644"
+      notify: Restart nginx
+
+    - name: Verificar la sintaxis de la configuracion de nginx
+      ansible.builtin.command: nginx -t
+      changed_when: false
+
+  handlers:
+    - name: Restart nginx
+      ansible.builtin.service:
+        name: nginx
+        state: restarted
+        enabled: true
+
+    - name: Restart sshd
+      ansible.builtin.service:
+        name: sshd
+        state: restarted
