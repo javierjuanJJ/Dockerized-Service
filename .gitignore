@@ -11,3 +11,9 @@ floci/data/
 .vscode/
 .idea/
 opencode.json
+
+# Dependencias y artefactos de build de la app Node.js
+app/node_modules/
+app/dist/
+app/npm-debug.log*
+app/.npm/

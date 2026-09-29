@@ -1,16 +1,24 @@
-# IaC en DigitalOcean con Terraform y Ansible
+# Despliegue de un servicio Node.js con GitHub Actions
 
-Proyecto práctico de **Infraestructura como Código (IaC)**: crear un Droplet en DigitalOcean con
-Terraform y configurarlo con un playbook de Ansible.
+Proyecto práctico de **CI/CD en toda la cadena**:
 
-- **Requisito principal:** escribir código Terraform que cree un Droplet en DigitalOcean con IP
-  pública y acceso por SSH usando una clave privada.
-- **Stretch goal:** playbook de Ansible que configure ese servidor.
+1. **IaC:** un Droplet en DigitalOcean se crea con Terraform y se configura con Ansible.
+2. **La app:** un servicio Node.js (Express) con `/` que responde `Hello, world!`.
+3. **Deploy manual:** el playbook `node_service.yml` (rol `app`) deja la app corriendo en el
+   puerto 80.
+4. **Deploy automático:** un workflow de GitHub Actions despliega en cada push a `main`, con dos
+   opciones: `ansible-playbook` (opción 1) y `rsync + SSH` (opción 2).
+
+- **Requisito principal:** código Terraform que cree un Droplet en DigitalOcean con IP pública,
+  configurado por Ansible (Node.js instalado).
+- **Reto 1:** rol `app` en Ansible que clone, instale dependencias, compile y arranque la app.
+- **Reto 2:** workflow de GitHub Actions (secrets + variables de entorno) que automatice el
+  despliegue.
 - **Anexo A (opcional):** replicar la misma IaC contra AWS emulado con
   [Floci](https://floci.io), gratis y en local.
 
 > Recordatorio: DigitalOcean cobra por Droplet activo. Cuando termines la práctica, ejecuta
-> `terraform destroy` (paso 10) para dejar de pagar.
+> `terraform destroy` (paso 13) para dejar de pagar.
 
 ---
 
@@ -19,7 +27,7 @@ Terraform y configurarlo con un playbook de Ansible.
 | Herramienta | Versión mínima | Para qué la usamos |
 |-------------|----------------|--------------------|
 | Terraform   | >= 1.5         | Crear el Droplet   |
-| Ansible     | ansible-core 2.14+ | Configurar el servidor |
+| Ansible     | ansible-core 2.15+ | Configurar el servidor y desplegar la app |
 | doctl (opcional) | reciente  | Listar regiones, sizes, imágenes y claves SSH |
 | Cuenta en DigitalOcean | — | Cuenta válida con un método de pago activo |
 
@@ -167,6 +175,12 @@ ansible-galaxy collection install -r ansible/requirements.yml
 
 ```
 IaC-on-DigitalOcean/
+├── app/                          # <-- servico Node.js (Express)
+│   ├── package.json              #     dependencias y scripts (build/start)
+│   ├── package-lock.json         #     fija las versiones para npm ci
+│   ├── scripts/build.js          #     compila src/ -> dist/ + build-info.json
+│   ├── src/index.js              #     GET / -> "Hello, world!", /healthz, /info
+│   └── (dist/ y node_modules/ no se versionan)
 ├── terraform/
 │   ├── main.tf                     # provider + ssh key + droplet
 │   ├── variables.tf                # variables de entrada
@@ -181,9 +195,20 @@ IaC-on-DigitalOcean/
 │   └── docker-compose.yml          # emulador local de AWS
 ├── ansible/
 │   ├── ansible.cfg
-│   ├── inventory.ini
+│   ├── inventory.ini               # grupos [droplets] y [app]
+│   ├── inventory.app.example.ini   # plantilla del grupo [app]
 │   ├── requirements.yml
-│   └── site.yml                    # playbook de configuración
+│   ├── site.yml                    # playbook de config del servidor
+│   ├── node_service.yml            # playbook de despliegue de la app <-- nuevo
+│   └── roles/
+│       └── app/                    # rol de despliegue (clonar, instalar, build, start)
+│           ├── defaults/main.yml
+│           ├── tasks/main.yml
+│           └── templates/node-service.service.j2
+├── .github/
+│   └── workflows/
+│       ├── deploy-ansible.yml      # Opción 1: deploy con ansible-playbook
+│       └── deploy-ssh.yml          # Opción 2: deploy con rsync + SSH
 └── README.md
 ```
 
@@ -317,13 +342,19 @@ terraform -chdir=terraform output -raw ansible_inventory_host
 # -> web-1 ansible_host=203.0.113.10 ansible_user=root
 ```
 
-Copia esa línea en `ansible/inventory.ini`:
+Copia esa línea en `ansible/inventory.ini` (añádela a ambos grupos, `[droplets]` y `[app]`):
 
 ```ini
 [droplets]
 web-1 ansible_host=203.0.113.10 ansible_user=root
 
 [droplets:vars]
+ansible_python_interpreter=/usr/bin/python3
+
+[app]
+web-1 ansible_host=203.0.113.10 ansible_user=root
+
+[app:vars]
 ansible_python_interpreter=/usr/bin/python3
 ```
 
@@ -350,6 +381,12 @@ Qué hace el playbook:
 4. Abre en el firewall los puertos 22, 80 y 443 y activa UFW.
 5. Despliega una página de prueba en `/var/www/html/index.html` y reinicia nginx.
 
+Node.js y npm **no** se instalan aquí: los instala el rol `app` durante el despliegue de la app
+(paso 11). Si la app escucha en el puerto 80 y nginx viene instalado del proyecto anterior,
+el rol `app` detiene nginx para que la app pueda ocupar el puerto. Si prefieres nginx como
+proxy inverso (app en 3000, nginx en 80), pon `app_port: 3000` y configura un `proxy_pass`
+en el virtualhost (fuera del alcance de este reto).
+
 ### Comprobar el resultado
 
 ```bash
@@ -367,7 +404,165 @@ ansible-playbook site.yml -e admin_user=deploy -e upgrade_packages=true
 
 ---
 
-## 10. Destruir la infraestructura
+## 10. La aplicacion Node.js
+
+La app vive en `app/`. Es un servidor Express minimalista con tres rutas:
+
+| Ruta | Descripcion |
+|------|-------------|
+| `GET /` | Devuelve `Hello, world!` (es el requisito del reto) |
+| `GET /healthz` | Healthcheck: `{"status":"ok"}` (lo usa Ansible y el workflow) |
+| `GET /info` | Vuela de la compilacion (commit y fecha, `build-info.json`) |
+
+`npm run build` copia `src/` a `dist/` y genera `dist/build-info.json` con el commit y la
+fecha de compilacion. `npm run start` lanza `dist/index.js`. Escucha en el puerto `80` por
+defecto (se cambia con la variable `PORT`).
+
+Comprobar en local:
+
+```bash
+cd app
+npm ci        # instala desde package-lock.json (determinista)
+npm run build
+PORT=3000 npm start
+curl localhost:3000/   # Hello, world!
+```
+
+Para que `npm ci` funcione en el servidor (via Ansible o GitHub Actions), `package-lock.json`
+se versiona.
+
+## 11. Desplegar la app con Ansible (rol `app`)
+
+El playbook `node_service.yml` es el que cumple el reto **Task #1**. Lanza el rol `app`, que
+hace exactamente esto:
+
+1. Instala **Node.js + npm** desde NodeSource (si no estan).
+2. Crea el usuario `nodeapp` y el directorio `/srv/node-service`.
+3. (Opcional) instala la deploy key y la clave publica del runner.
+4. **Clona** o actualiza el repositorio en `/srv/node-service/app`.
+5. **Instala** las dependencias con `npm ci` (solo dependencias de produccion).
+6. **Compila** la app con `npm run build`.
+7. **Arranca** la app como servicio systemd `node-service` en el **puerto 80**, reinicia
+   automaticamente y habilita el arranque al boot.
+8. Ejecuta un **healthcheck** contra `http://127.0.0.1:80/healthz`.
+
+Para poder desplegar, el servidor debe estar creado (paso 7) y el inventario apuntando a la IP
+real (paso 9). El playbook usa el grupo `[app]`, que ya esta incluido en `inventory.ini`.
+
+Variables que admite el rol (todas con valor por defecto en `roles/app/defaults/main.yml`):
+
+| Variable | Defecto | Descripcion |
+|----------|---------|-------------|
+| `app_repo` | `https://github.com/OWNER/REPO.git` | Repositorio a clonar |
+| `app_branch` | `main` | Rama a desplegar |
+| `app_commit` | *(vacio)* | Si se fija un SHA, desplegara *exactamente* ese commit |
+| `app_deploy_key` | *(vacio)* | Deploy key privada para repositorios privados |
+| `app_runner_ssh_public_key` | *(vacio)* | Clave publica del runner para `.ssh/authorized_keys` |
+| `app_port` | `80` | Puerto del servicio |
+| `nodejs_version` | `20.x` | Version de Node.js instalada |
+
+Despliegue manual:
+
+```bash
+cd ansible
+ansible-playbook node_service.yml --tags app
+```
+
+O con variables para un repositorio en concreto:
+
+```bash
+ansible-playbook node_service.yml --tags app \
+  -e app_repo=git@github.com:tu-usuario/tu-repo.git \
+  -e 'app_deploy_key=-----BEGIN OPENSSH PRIVATE KEY-----...'
+```
+
+Cuando termine, compruebalo desde tu maquina:
+
+```bash
+curl -s http://203.0.113.10/          # Hello, world!
+curl -s http://203.0.113.10/healthz   # {"status":"ok"}
+```
+
+> El servicio corre con el usuario `nodeapp` (no root) y usa `AmbientCapabilities` para poder
+> escuchar en el puerto 80.
+
+## 12. Automatizar el despliegue con GitHub Actions
+
+El reto **Task #2** pide un workflow. Hay dos, para que puedas probar ambas opciones. Ambos
+comparten los mismos secrets y hacen lo mismo: en cada push a `main` (o manual), compilan la app
+en un runner, la despliegan en el Droplet y verifican que responda.
+
+### Secrets que necesitas crear
+
+Ve a *Settings → Secrets and variables → Actions → New repository secret*:
+
+| Secret | Opcion 1 (Ansible) | Opcion 2 (rsync) | Descripcion |
+|--------|:---:|:---:|-------------|
+| `SERVER_HOST` | si | si | IP publica del Droplet |
+| `SERVER_USER` | si | si | Usuario SSH. `root` en un droplet recien creado |
+| `SERVER_SSH_KEY` | si | si | Clave **privada** SSH que puede entrar al Droplet |
+| `APP_DEPLOY_KEY` | solo repo privado | - | Deploy key GitHub para que el servidor clone el repo |
+| `SERVER_HOST_KEY` | opcional | - | Host key del Droplet (si no, se usa `ssh-keyscan`) |
+| `SERVER_FINGERPRINT` | - | opcional | Huella SHA256 del host (evita MITM) |
+
+> **Nunca** pongas la clave privada directamente en el codigo: siempre a traves de secrets. Los
+> valores se muestran como `***` en los logs.
+
+### Opcion 1: `deploy-ansible.yml` (con `ansible-playbook`)
+
+El job `build` compila y prueba la app en un runner de GitHub. Solo al llegar a `main`, el job
+`deploy`:
+
+1. Instala `ansible-core` y las colecciones.
+2. Genera `inventory.ini` a partir de `SERVER_HOST` y `SERVER_USER`.
+3. Ejecuta el playbook con la deploy key y el SHA exacto del push:
+
+   ```bash
+   ansible-playbook node_service.yml --tags app \
+     --extra-vars "app_repo=git@github.com:OWNER/REPO.git" \
+     --extra-vars "app_deploy_key=$APP_DEPLOY_KEY" \
+     --extra-vars "app_commit=$SHA"
+   ```
+4. Hace `curl http://$SERVER_HOST/` para verificar el despliegue.
+
+El rol `app` instala Node.js en el servidor, asi que la primera ejecucion prepara todo.
+
+### Opcion 2: `deploy-ssh.yml` (con rsync + SSH)
+
+Sin Ansible en el runner: el codigo se copia al servidor con `rsync` (mediante
+[webfactory/ssh-agent](https://github.com/webfactory/ssh-agent) y
+[appleboy/ssh-action](https://github.com/appleboy/ssh-action)) y el servicio se reinicia.
+
+1. `web-factory/ssh-agent` carga la clave en el agente SSH del runner. (El proyecto original del
+   reto referencia `web-factory/ssh-agent`; ese repositorio ya responde como
+   **webfactory/ssh-agent**, que es el que se usa aqui.)
+2. `rsync -az --delete` sube solo `app/` a `/tmp/node-service-release/`.
+3. `appleboy/ssh-action` ejecuta en el servidor: instala Node.js si falta, copia a
+   `/opt/app/`, `npm ci --omit=dev`, `npm run build`, crea la unidad systemd (si no existe) y
+   reinicia el servicio.
+4. Mismo healthcheck final que en la opcion 1.
+
+Obtener la huella para `SERVER_FINGERPRINT`:
+
+```bash
+ssh-keyscan 203.0.113.10 | ssh-keygen -lf -   # copiar el valor SHA256:...
+```
+
+### Ver las dos opciones en accion
+
+```bash
+# 1) sube el codigo a GitHub
+git push origin main
+
+# 2) abre el repositorio -> Actions -> Deploy (Ansible) / Deploy (SSH+rsync)
+```
+
+Cualquier cambio en `app/` dispara ambos workflows; basta con que uno de los dos tenga los
+secrets completos para que el despliegue funcione.
+
+---
+
+## 13. Destruir la infraestructura
 
 Cuando termines, **destruye el Droplet para no seguir pagando**:
 
@@ -390,7 +585,7 @@ terraform apply -replace=digitalocean_ssh_key.this    # forzar recreacion
 
 ---
 
-## 11. Publicar la solución en la comunidad
+## 14. Publicar la solución en la comunidad
 
 Este proyecto forma parte de un reto comunitario: la idea es que otras personas ejecuten tu código
 y te den feedback.
@@ -414,7 +609,7 @@ y te den feedback.
 
 ---
 
-## 12. Buenas prácticas
+## 15. Buenas prácticas
 
 - **El estado es sacred:** versiona el código, nunca edites el `.tfstate` a mano.
 - **Nada de secretos en git:** tokens solo en `terraform.tfvars`, variables de entorno o un
@@ -431,7 +626,7 @@ y te den feedback.
 
 ---
 
-## 13. Solución de problemas
+## 16. Solución de problemas
 
 | Síntoma | Causa probable | Solución |
 |---------|----------------|----------|
