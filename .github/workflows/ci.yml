@@ -1,0 +1,28 @@
+---
+# Pipeline de integracion continua: se ejecuta en cada push y en cada PR.
+#
+# No publica nada en el registro (push: false). Reutiliza `build-push.yml`, que
+# ademas comprueba que la imagen no contiene el fichero .env y que el servicio
+# arranca con /secret protegido.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests, build de la imagen y smoke test
+    uses: ./.github/workflows/build-push.yml
+    with:
+      push: false

@@ -17,3 +17,8 @@ app/node_modules/
 app/dist/
 app/npm-debug.log*
 app/.npm/
+
+# Secretos: nunca se suben al repo ni entran en la imagen de Docker
+.env
+.env.*
+!.env.example

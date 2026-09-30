@@ -1,0 +1,27 @@
+# Keep the build context small and make sure secrets never enter the image.
+#
+# The Dockerfile only COPYs explicit files, so .env is excluded twice over:
+# once here (defence in depth) and once by not being referenced in any COPY.
+
+# Secrets — never build a local .env into an image
+.env
+.env.*
+!.env.example
+
+# Dependencies and build output: reinstalled and regenerated inside the image
+node_modules
+npm-debug.log*
+.npm
+dist
+
+# Not needed to run the service (src/ and scripts/ are required by the build stage)
+test
+.git
+.gitignore
+.dockerignore
+Dockerfile
+README.md
+*.md
+coverage
+.vscode
+.idea

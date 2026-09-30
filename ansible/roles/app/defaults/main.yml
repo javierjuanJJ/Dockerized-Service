@@ -1,39 +1,47 @@
 ---
-# Valores por defecto del rol `app`. Se pueden sobreescribir sin editar el rol:
-#   ansible-playbook node_service.yml --tags app -e app_branch=staging
+# Valores por defecto del rol `app` (despliegue del servicio Docker).
+# Se pueden sobreescribir sin editar el rol:
+#   ansible-playbook node_service.yml --tags app -e app_image=ghcr.io/OWNER/node-service:v1
 
-# Donde vive el codigo en el servidor
+# Donde vive la configuracion del servicio en el servidor
 app_dir: /srv/node-service
-app_user: nodeapp
-app_group: nodeapp
-
-# Repositorio. Usa SSH (git@github.com:OWNER/REPO.git) con deploy key, o HTTPS si
-# el repositorio es publico.
-app_repo: https://github.com/OWNER/REPO.git
-app_branch: main
-app_commit: ""          # si se define, hace checkout exacto de ese sha (despliegue inmutable)
-app_repo_force_update: true
-
-# Clave publica del runner de GitHub Actions. Si se define, se copia a
-# authorized_keys del usuario de despliegue para que el servidor pueda tirar de ella
-# (complementa a la deploy key, por ejemplo para git fetch de repos privados).
-app_runner_ssh_public_key: ""
-
-# Clave privada de despliegue (deploy key). Solo se usa si el repo es privado.
-# En GitHub Actions se inyecta desde el secret APP_DEPLOY_KEY con
-#   -e app_deploy_key="$APP_DEPLOY_KEY"
-app_deploy_key: ""
-app_deploy_key_path: /home/{{ app_user }}/.ssh/id_deploy
-app_known_hosts: "github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl"
-
-# Toolchain
-nodejs_version: "20.x"
-npm_always_install: true
-
-# Servicio. La app escucha directamente en app_port (80 por defecto).
-# El rol apaga nginx si viene instalado del proyecto anterior para no competir por el puerto.
-app_port: 80
-app_service_name: node-service
-app_service_description: "Node.js service (Hello, world!)"
-app_node_env: "production"
+app_compose_project: node-service
 app_healthcheck_path: /healthz
+
+# Imagen a desplegar. La construye y publica el workflow de GitHub Actions.
+app_image: ghcr.io/OWNER/node-service:latest
+app_image_pull_policy: always      # always | missing | never
+
+# Puertos: el contenedor escucha en 3000 (no root, no puede usar puertos
+# privilegiados) y el puerto 80 se publica desde el host.
+app_host_port: 80
+app_container_port: 3000
+
+app_restart_policy: unless-stopped
+app_log_max_size: 10m
+app_log_max_files: "3"
+
+# Secretos de la aplicacion. Se escriben en app_env_file en el servidor con
+# permisos 0600 y NUNCA se imprimen en la salida de Ansible (no_log).
+#
+# Recomendado: no ponerlos aqui en claro, sino pasarlos desde un fichero
+# cifrado con `ansible-vault`:
+#   ansible-vault encrypt group_vars/all/vault.yml
+#   ansible-playbook node_service.yml -e @group_vars/all/vault.yml
+app_env:
+  SECRET_MESSAGE: "change-me"
+  USERNAME: "change-me"
+  PASSWORD: "change-me"
+app_env_file: "{{ app_dir }}/.env"
+
+# Credenciales del registro de contenedores (GHCR). Si se dejan vacias, el
+# servidor solo puede tirar de imagenes publicas.
+app_registry_url: ""
+app_registry_username: ""
+app_registry_password: ""
+app_registry_auth_file: /root/.docker/config.json
+
+# Instalacion de Docker desde los repositorios de la distribucion.
+docker_packages:
+  - docker.io
+  - docker-compose-v2

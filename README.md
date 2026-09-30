@@ -1,24 +1,49 @@
-# Despliegue de un servicio Node.js con GitHub Actions
+# Despliegue de un servicio Node.js dockerizado con GitHub Actions
 
 Proyecto práctico de **CI/CD en toda la cadena**:
 
-1. **IaC:** un Droplet en DigitalOcean se crea con Terraform y se configura con Ansible.
-2. **La app:** un servicio Node.js (Express) con `/` que responde `Hello, world!`.
-3. **Deploy manual:** el playbook `node_service.yml` (rol `app`) deja la app corriendo en el
-   puerto 80.
-4. **Deploy automático:** un workflow de GitHub Actions despliega en cada push a `main`, con dos
-   opciones: `ansible-playbook` (opción 1) y `rsync + SSH` (opción 2).
+1. **La app:** un servicio Node.js (Express) con `/` que responde `Hello, world!` y `/secret`
+   protegido con Basic Auth.
+2. **Docker:** un `Dockerfile` multi-stage que genera una imagen mínima y **sin secretos**.
+3. **IaC:** un Droplet en DigitalOcean se crea con Terraform y se configura con Ansible.
+4. **Deploy automático:** un workflow de GitHub Actions compila la imagen, la publica en
+   `ghcr.io` y la despliega en el Droplet, pasando los secretos **en tiempo de despliegue**.
 
-- **Requisito principal:** código Terraform que cree un Droplet en DigitalOcean con IP pública,
-  configurado por Ansible (Node.js instalado).
-- **Reto 1:** rol `app` en Ansible que clone, instale dependencias, compile y arranque la app.
-- **Reto 2:** workflow de GitHub Actions (secrets + variables de entorno) que automatice el
-  despliegue.
+- **Requisito principal:** la app dockerizada y desplegada en un servidor remoto real.
+- **Reto 1:** la imagen se construye y funciona en local, y **no contiene el `.env`**.
+- **Reto 2:** pipeline que publica la imagen en un registro y la despliega sin intervention manual.
 - **Anexo A (opcional):** replicar la misma IaC contra AWS emulado con
   [Floci](https://floci.io), gratis y en local.
 
+> El servidor **no compila nada**: descarga la imagen ya construida y probada. Eso hace el
+> despliegue rápido, reproducible y reversible (basta con volver a desplegar una etiqueta vieja).
+
 > Recordatorio: DigitalOcean cobra por Droplet activo. Cuando termines la práctica, ejecuta
-> `terraform destroy` (paso 13) para dejar de pagar.
+> `terraform destroy` (paso 14) para dejar de pagar.
+
+---
+
+## Cómo encaja todo
+
+```
+  git push a main
+        |
+        v
+  [ ci.yml / deploy.yml ]   ->  build-push.yml  ->  npm test
+        |                                          docker build
+        |                                          comprueba que NO hay .env
+        v
+  ghcr.io/<tu-usuario>/dockerized-service:<sha>
+        |
+        v
+  [ deploy ]  Ansible (deploy.yml)  o  SSH puro (deploy-ssh.yml)
+        |      -> docker login en el servidor
+        |      -> docker compose pull
+        |      -> docker compose up -d
+        |      -> curl de verificación
+        v
+  Droplet :80  ->  contenedor node-service  ->  /  y  /secret
+```
 
 ---
 
@@ -26,8 +51,10 @@ Proyecto práctico de **CI/CD en toda la cadena**:
 
 | Herramienta | Versión mínima | Para qué la usamos |
 |-------------|----------------|--------------------|
+| Docker      | con `buildx`   | Construir y ejecutar la imagen de la app |
+| Node.js     | >= 20          | Tests y desarrollo local |
 | Terraform   | >= 1.5         | Crear el Droplet   |
-| Ansible     | ansible-core 2.15+ | Configurar el servidor y desplegar la app |
+| Ansible     | ansible-core 2.15+ | Configurar el servidor y desplegar el contenedor |
 | doctl (opcional) | reciente  | Listar regiones, sizes, imágenes y claves SSH |
 | Cuenta en DigitalOcean | — | Cuenta válida con un método de pago activo |
 
@@ -174,13 +201,18 @@ ansible-galaxy collection install -r ansible/requirements.yml
 ## 5. Estructura del proyecto
 
 ```
-IaC-on-DigitalOcean/
-├── app/                          # <-- servico Node.js (Express)
-│   ├── package.json              #     dependencias y scripts (build/start)
+Dockerized-Service/
+├── app/                          # <-- servicio Node.js (Express) dockerizado
+│   ├── package.json              #     dependencias y scripts (build/start/test)
 │   ├── package-lock.json         #     fija las versiones para npm ci
+│   ├── Dockerfile                #     build multi-stage: build -> runtime mínimo  <-- nuevo
+│   ├── .dockerignore             #     excluye .env, node_modules y test del contexto  <-- nuevo
+│   ├── .env.example              #     plantilla de las variables de entorno  <-- nuevo
 │   ├── scripts/build.js          #     compila src/ -> dist/ + build-info.json
-│   ├── src/index.js              #     GET / -> "Hello, world!", /healthz, /info
-│   └── (dist/ y node_modules/ no se versionan)
+│   ├── src/index.js              #     GET /, GET /secret (Basic Auth), /healthz, /info
+│   ├── src/env.js                #     carga .env sin dependencias y valida las vars  <-- nuevo
+│   ├── test/app.test.js          #     tests con el runner integrado de Node  <-- nuevo
+│   └── (dist/, node_modules/, .env no se versionan)
 ├── terraform/
 │   ├── main.tf                     # provider + ssh key + droplet
 │   ├── variables.tf                # variables de entrada
@@ -199,16 +231,18 @@ IaC-on-DigitalOcean/
 │   ├── inventory.app.example.ini   # plantilla del grupo [app]
 │   ├── requirements.yml
 │   ├── site.yml                    # playbook de config del servidor
-│   ├── node_service.yml            # playbook de despliegue de la app <-- nuevo
+│   ├── node_service.yml            # playbook de despliegue del contenedor
 │   └── roles/
-│       └── app/                    # rol de despliegue (clonar, instalar, build, start)
+│       └── app/                    # rol de despliegue con Docker (no compila código)
 │           ├── defaults/main.yml
 │           ├── tasks/main.yml
-│           └── templates/node-service.service.j2
+│           └── templates/docker-compose.yml.j2
 ├── .github/
 │   └── workflows/
-│       ├── deploy-ansible.yml      # Opción 1: deploy con ansible-playbook
-│       └── deploy-ssh.yml          # Opción 2: deploy con rsync + SSH
+│       ├── build-push.yml          # workflow reutilizable: test + build + push a ghcr.io
+│       ├── ci.yml                  # PR y push: valida sin publicar
+│       ├── deploy.yml              # Opción 1 (recomendada): ghcr.io + Ansible
+│       └── deploy-ssh.yml          # Opción 2: ghcr.io + SSH, sin Ansible
 └── README.md
 ```
 
@@ -381,11 +415,13 @@ Qué hace el playbook:
 4. Abre en el firewall los puertos 22, 80 y 443 y activa UFW.
 5. Despliega una página de prueba en `/var/www/html/index.html` y reinicia nginx.
 
-Node.js y npm **no** se instalan aquí: los instala el rol `app` durante el despliegue de la app
-(paso 11). Si la app escucha en el puerto 80 y nginx viene instalado del proyecto anterior,
-el rol `app` detiene nginx para que la app pueda ocupar el puerto. Si prefieres nginx como
-proxy inverso (app en 3000, nginx en 80), pon `app_port: 3000` y configura un `proxy_pass`
-en el virtualhost (fuera del alcance de este reto).
+Node.js y npm **no** se instalan en el servidor: el despliegue usa una imagen de Docker ya
+construida (paso 11). Este playbook es opcional y sirve para endurecer el servidor; si lo
+ejecutas, el rol `app` **detiene nginx** (que ocupa el 80) antes de arrancar el contenedor.
+
+Si prefieres nginx como proxy inverso (contenedor en 3000, nginx en 80), cambia
+`app_host_port: 3000` en `roles/app/defaults/main.yml` y configura un `proxy_pass` hacia
+`127.0.0.1:3000` (fuera del alcance de este reto).
 
 ### Comprobar el resultado
 
@@ -406,163 +442,238 @@ ansible-playbook site.yml -e admin_user=deploy -e upgrade_packages=true
 
 ## 10. La aplicacion Node.js
 
-La app vive en `app/`. Es un servidor Express minimalista con tres rutas:
+La app vive en `app/`. Es un servidor Express minimalista con cuatro rutas:
 
 | Ruta | Descripcion |
 |------|-------------|
 | `GET /` | Devuelve `Hello, world!` (es el requisito del reto) |
-| `GET /healthz` | Healthcheck: `{"status":"ok"}` (lo usa Ansible y el workflow) |
+| `GET /secret` | **Protegida con Basic Auth.** Devuelve `SECRET_MESSAGE` |
+| `GET /healthz` | Healthcheck: `{"status":"ok"}` (lo usa el contenedor y el workflow) |
 | `GET /info` | Vuela de la compilacion (commit y fecha, `build-info.json`) |
 
-`npm run build` copia `src/` a `dist/` y genera `dist/build-info.json` con el commit y la
-fecha de compilacion. `npm run start` lanza `dist/index.js`. Escucha en el puerto `80` por
-defecto (se cambia con la variable `PORT`).
+### Variables de entorno
 
-Comprobar en local:
+Se configuran en un `.env` en local, y se inyectan como variables de entorno en el servidor.
+
+| Variable | Obligatoria | Descripcion |
+|----------|:---:|-------------|
+| `SECRET_MESSAGE` | si | Texto que devuelve `/secret` tras autenticarse |
+| `USERNAME` | si | Usuario de Basic Auth |
+| `PASSWORD` | si | Contrasena de Basic Auth |
+| `PORT` | no | Puerto de escucha (80 por defecto; 3000 dentro del contenedor) |
+
+`src/env.js` carga el `.env` **sin dependencias externas** y, sobre todo, hace que las variables
+de entorno reales **ganen siempre** sobre el fichero. La app **falla al arrancar** si falta
+alguna obligatoria, en lugar de servir respuestas rotas:
 
 ```bash
 cd app
-npm ci        # instala desde package-lock.json (determinista)
-npm run build
-PORT=3000 npm start
-curl localhost:3000/   # Hello, world!
+cp .env.example .env     # edita SECRET_MESSAGE, USERNAME y PASSWORD
+npm ci
+npm test                 # 10 tests con el runner integrado de Node
+PORT=3000 npm run dev    # desarrollo: src/ directamente
 ```
 
-Para que `npm ci` funcione en el servidor (via Ansible o GitHub Actions), `package-lock.json`
-se versiona.
+Comprobar las rutas en local:
 
-## 11. Desplegar la app con Ansible (rol `app`)
+```bash
+curl localhost:3000/                                  # Hello, world!
+curl -i localhost:3000/secret                         # 401 + WWW-Authenticate (pide credenciales)
+curl -u admin:supersecret localhost:3000/secret       # This is the secret message
+curl -u admin:incorrecto localhost:3000/secret        # Invalid username or password
+```
 
-El playbook `node_service.yml` es el que cumple el reto **Task #1**. Lanza el rol `app`, que
-hace exactamente esto:
+> La comparacion de credenciales usa `crypto.timingSafeEqual`, y las del mismo tamanho se
+> comparan en tiempo constante, para no filtrar el valor esperado por tiempos de respuesta.
 
-1. Instala **Node.js + npm** desde NodeSource (si no estan).
-2. Crea el usuario `nodeapp` y el directorio `/srv/node-service`.
-3. (Opcional) instala la deploy key y la clave publica del runner.
-4. **Clona** o actualiza el repositorio en `/srv/node-service/app`.
-5. **Instala** las dependencias con `npm ci` (solo dependencias de produccion).
-6. **Compila** la app con `npm run build`.
-7. **Arranca** la app como servicio systemd `node-service` en el **puerto 80**, reinicia
-   automaticamente y habilita el arranque al boot.
-8. Ejecuta un **healthcheck** contra `http://127.0.0.1:80/healthz`.
+## 11. Dockerizar la app
 
-Para poder desplegar, el servidor debe estar creado (paso 7) y el inventario apuntando a la IP
-real (paso 9). El playbook usa el grupo `[app]`, que ya esta incluido en `inventory.ini`.
+### El Dockerfile
+
+`app/Dockerfile` es un build de **dos etapas**:
+
+| Etapa | Qué hace |
+|-------|----------|
+| `build` | `npm ci`, ejecuta `npm run build` (genera `dist/`) y hace `npm prune --omit=dev` |
+| `runtime` | Solo recibe `dist/`, `node_modules` (sin dev) y `package.json` |
+
+La etapa de runtime **no recibe el código fuente, ni las dependencias de desarrollo, ni el
+`.env`**: cruzan unicamente artefactos. Además:
+
+- corre como el usuario `node` (sin root);
+- expone el puerto **3000** (un usuario sin privilegios no puede abrir el 80; el 80 se publica
+  desde el host);
+- define un `HEALTHCHECK` contra `/healthz` usando el `fetch` de Node, sin instalar `curl`;
+- acepta `BUILD_DATE` y `VCS_REF` como metadatos, que acaban en `/info`.
+
+`app/.dockerignore` deja fuera del contexto `.env`, `node_modules`, `dist` y `test`.
+
+### Construir y ejecutar en local
+
+```bash
+cd app
+
+# Construir la imagen
+docker build -t node-service:local .
+
+# Ejecutarla pasando los secretos en tiempo de ejecución
+docker run --rm -p 3000:3000 --env-file .env node-service:local
+
+curl localhost:3000/                            # Hello, world!
+curl -u admin:supersecret localhost:3000/secret # This is the secret message
+```
+
+Sin secretos, el contenedor **se apaga con error** (es lo que se busca: antes que servir una
+ruta `/secret` vacía o rota):
+
+```bash
+docker run --rm node-service:local
+# Error: Missing required environment variable(s): SECRET_MESSAGE, USERNAME, PASSWORD.
+```
+
+### Comprobar que el `.env` NO está en la imagen
+
+Es un requisito explícito del proyecto, y el pipeline lo verifica solo en cada PR:
+
+```bash
+docker run --rm --entrypoint sh node-service:local -c 'ls -a /app'
+# .  ..  dist  node_modules  package.json   <-- ni .env, ni src/, ni test/
+
+docker run --rm --entrypoint sh node-service:local -c 'find / -name ".env*" 2>/dev/null'
+# (sin salida)
+```
+
+## 12. Desplegar la app con Ansible (rol `app`)
+
+El playbook `node_service.yml` lanza el rol `app`, que instala Docker y hace funcionar el
+contenedor. **No clona ni compila nada**: la imagen ya la construyó y probó el pipeline.
+
+1. Instala **Docker** y el plugin de `docker compose` desde los repositorios de la distribucion.
+2. Crea `/srv/node-service`.
+3. Escribe `/srv/node-service/.env` con los secretos, **modo `0600`** y con `no_log` para que no
+   aparezcan en la salida de Ansible.
+4. Hace `docker login` en el registro (PAT de solo lectura) usando `--password-stdin`.
+5. Escribe `docker-compose.yml` desde la plantilla.
+6. `docker compose pull` y `docker compose up -d`.
+7. Limpia imagenes huerfanas (`docker image prune`).
+8. Healthcheck contra `http://127.0.0.1:80/healthz`.
 
 Variables que admite el rol (todas con valor por defecto en `roles/app/defaults/main.yml`):
 
 | Variable | Defecto | Descripcion |
 |----------|---------|-------------|
-| `app_repo` | `https://github.com/OWNER/REPO.git` | Repositorio a clonar |
-| `app_branch` | `main` | Rama a desplegar |
-| `app_commit` | *(vacio)* | Si se fija un SHA, desplegara *exactamente* ese commit |
-| `app_deploy_key` | *(vacio)* | Deploy key privada para repositorios privados |
-| `app_runner_ssh_public_key` | *(vacio)* | Clave publica del runner para `.ssh/authorized_keys` |
-| `app_port` | `80` | Puerto del servicio |
-| `nodejs_version` | `20.x` | Version de Node.js instalada |
+| `app_image` | `ghcr.io/OWNER/node-service:latest` | Imagen a desplegar |
+| `app_env` | `SECRET_MESSAGE`/`USERNAME`/`PASSWORD` en `change-me` | **Secretos** de la app |
+| `app_env_file` | `/srv/node-service/.env` | Donde se escriben los secretos |
+| `app_registry_url` | *(vacio)* | Registro, p. ej. `ghcr.io` |
+| `app_registry_username` | *(vacio)* | Usuario del PAT de solo lectura |
+| `app_registry_password` | *(vacio)* | PAT con permiso `read:packages` |
+| `app_host_port` | `80` | Puerto publicado en el host |
+| `app_container_port` | `3000` | Puerto dentro del contenedor |
+| `app_healthcheck_path` | `/healthz` | Ruta usada en el healthcheck |
+| `app_image_pull_policy` | `always` | `always`, `missing` o `never` |
 
-Despliegue manual:
+Despliegue manual (para depurar antes de automatizar):
 
 ```bash
 cd ansible
-ansible-playbook node_service.yml --tags app
-```
-
-O con variables para un repositorio en concreto:
-
-```bash
 ansible-playbook node_service.yml --tags app \
-  -e app_repo=git@github.com:tu-usuario/tu-repo.git \
-  -e 'app_deploy_key=-----BEGIN OPENSSH PRIVATE KEY-----...'
+  -e app_image=ghcr.io/tu-usuario/dockerized-service:main \
+  -e app_registry_url=ghcr.io \
+  -e app_registry_username=tu-usuario \
+  -e app_registry_password=ghp_xxxxxxxx \
+  -e 'app_env={"SECRET_MESSAGE":"hola","USERNAME":"admin","PASSWORD":"clave"}'
 ```
 
-Cuando termine, compruebalo desde tu maquina:
+## 13. Automatizar el despliegue con GitHub Actions
 
-```bash
-curl -s http://203.0.113.10/          # Hello, world!
-curl -s http://203.0.113.10/healthz   # {"status":"ok"}
-```
+Hay cuatro workflows:
 
-> El servicio corre con el usuario `nodeapp` (no root) y usa `AmbientCapabilities` para poder
-> escuchar en el puerto 80.
+| Workflow | Cuando | Que hace |
+|----------|---------|----------|
+| `build-push.yml` | reutilizable | `npm test`, `docker build`, publica en `ghcr.io` |
+| `ci.yml` | push y PR | llama a `build-push.yml` **sin publicar** y valida la imagen |
+| `deploy.yml` | push a `main` / manual | publica la imagen y despliega **con Ansible** (recomendado) |
+| `deploy-ssh.yml` | push a `main` / manual | publica la imagen y despliega **por SSH**, sin Ansible |
 
-## 12. Automatizar el despliegue con GitHub Actions
+`build-push.yml` es un workflow reutilizable (`workflow_call`) para que los tres caminos de
+integracion compartan exactamente el mismo build. Cuando `push: false`, ademas:
 
-El reto **Task #2** pide un workflow. Hay dos, para que puedas probar ambas opciones. Ambos
-comparten los mismos secrets y hacen lo mismo: en cada push a `main` (o manual), compilan la app
-en un runner, la despliegan en el Droplet y verifican que responda.
+- comprueba que `.env` esta en `.gitignore` (con `git check-ignore`);
+- inspecciona la imagen y falla si encuentra cualquier `.env`;
+- arranca el contenedor y verifica `/` y que `/secret` responde `401` sin credenciales.
 
 ### Secrets que necesitas crear
 
 Ve a *Settings → Secrets and variables → Actions → New repository secret*:
 
-| Secret | Opcion 1 (Ansible) | Opcion 2 (rsync) | Descripcion |
-|--------|:---:|:---:|-------------|
-| `SERVER_HOST` | si | si | IP publica del Droplet |
-| `SERVER_USER` | si | si | Usuario SSH. `root` en un droplet recien creado |
-| `SERVER_SSH_KEY` | si | si | Clave **privada** SSH que puede entrar al Droplet |
-| `APP_DEPLOY_KEY` | solo repo privado | - | Deploy key GitHub para que el servidor clone el repo |
-| `SERVER_HOST_KEY` | opcional | - | Host key del Droplet (si no, se usa `ssh-keyscan`) |
-| `SERVER_FINGERPRINT` | - | opcional | Huella SHA256 del host (evita MITM) |
+| Secret | Necesario para | Descripcion |
+|--------|----------------|-------------|
+| `SERVER_HOST` | despliegue | IP publica del Droplet |
+| `SERVER_USER` | despliegue | Usuario SSH. `root` en un droplet recien creado |
+| `SERVER_SSH_KEY` | despliegue | Clave **privada** SSH que puede entrar al Droplet |
+| `GHCR_USERNAME` | despliegue | Usuario del PAT de solo lectura |
+| `GHCR_READ_TOKEN` | despliegue | PAT con permiso `read:packages` sobre el paquete de `ghcr.io` |
+| `APP_SECRET_MESSAGE` | despliegue | Valor de `SECRET_MESSAGE` en produccion |
+| `APP_USERNAME` | despliegue | Usuario de Basic Auth en produccion |
+| `APP_PASSWORD` | despliegue | Contrasena de Basic Auth en produccion |
 
-> **Nunca** pongas la clave privada directamente en el codigo: siempre a traves de secrets. Los
-> valores se muestran como `***` en los logs.
+> **Nunca** pongas la clave privada ni los secretos en el codigo: siempre a traves de secrets.
+> Los valores se muestran como `***` en los logs.
 
-### Opcion 1: `deploy-ansible.yml` (con `ansible-playbook`)
+> **Por que el `GITHUB_TOKEN` no se usa en el servidor:** el token que publica la imagen lo emite
+> GitHub por ejecucion y tiene permisos amplios. El servidor usa un PAT separado y de **solo
+> lectura**, para que un compromiso del Droplet no permita publicar imagenes falsas.
 
-El job `build` compila y prueba la app en un runner de GitHub. Solo al llegar a `main`, el job
-`deploy`:
+### Opcion 1 (recomendada): `deploy.yml`, con Ansible
 
-1. Instala `ansible-core` y las colecciones.
-2. Genera `inventory.ini` a partir de `SERVER_HOST` y `SERVER_USER`.
-3. Ejecuta el playbook con la deploy key y el SHA exacto del push:
+1. `build-push.yml` publica la imagen etiquetada **con el SHA del commit** (y `latest`).
+2. El job `deploy` instala `ansible-core`, prepara `~/.ssh` y la `known_hosts`, y genera
+   `inventory.ini` a partir de `SERVER_HOST` y `SERVER_USER`.
+3. Los secrets llegan a Ansible como variables de entorno y se montan en un JSON con `python3`,
+   de forma que **ningun valor queda literal en la linea de comandos** (ni por tanto en los logs):
 
    ```bash
-   ansible-playbook node_service.yml --tags app \
-     --extra-vars "app_repo=git@github.com:OWNER/REPO.git" \
-     --extra-vars "app_deploy_key=$APP_DEPLOY_KEY" \
-     --extra-vars "app_commit=$SHA"
+   ansible-playbook node_service.yml --tags app -e @~/.config/ansible/deploy_vars.json
    ```
-4. Hace `curl http://$SERVER_HOST/` para verificar el despliegue.
 
-El rol `app` instala Node.js en el servidor, asi que la primera ejecucion prepara todo.
+4. Un healthcheck verifica `/` y que `/secret` sigue devolviendo `401` sin credenciales y el
+   secreto correcto con ellas.
 
-### Opcion 2: `deploy-ssh.yml` (con rsync + SSH)
+El `environment: production` del job activa las reglas de proteccion y aprobacion de GitHub, para
+que nadie despliegue a produccion sin pasar por la revision.
 
-Sin Ansible en el runner: el codigo se copia al servidor con `rsync` (mediante
-[webfactory/ssh-agent](https://github.com/webfactory/ssh-agent) y
-[appleboy/ssh-action](https://github.com/appleboy/ssh-action)) y el servicio se reinicia.
+### Opcion 2: `deploy-ssh.yml`, sin Ansible
 
-1. `web-factory/ssh-agent` carga la clave en el agente SSH del runner. (El proyecto original del
-   reto referencia `web-factory/ssh-agent`; ese repositorio ya responde como
-   **webfactory/ssh-agent**, que es el que se usa aqui.)
-2. `rsync -az --delete` sube solo `app/` a `/tmp/node-service-release/`.
-3. `appleboy/ssh-action` ejecuta en el servidor: instala Node.js si falta, copia a
-   `/opt/app/`, `npm ci --omit=dev`, `npm run build`, crea la unidad systemd (si no existe) y
-   reinicia el servicio.
-4. Mismo healthcheck final que en la opcion 1.
+Mismo resultado sin `ansible-playbook` en el runner: el propio job genera el
+`docker-compose.yml` y el `.env`, los sube por SSH (canal cifrado, `0600` en el servidor), hace
+`docker login` con el PAT de solo lectura y ejecuta `docker compose pull && up -d`.
 
-Obtener la huella para `SERVER_FINGERPRINT`:
-
-```bash
-ssh-keyscan 203.0.113.10 | ssh-keygen -lf -   # copiar el valor SHA256:...
-```
-
-### Ver las dos opciones en accion
+### Ver el pipeline en accion
 
 ```bash
 # 1) sube el codigo a GitHub
 git push origin main
 
-# 2) abre el repositorio -> Actions -> Deploy (Ansible) / Deploy (SSH+rsync)
+# 2) abre el repositorio -> Actions
+#    "CI" se ejecuta en el push; "Deploy (GHCR + Ansible)" despliega a produccion
 ```
 
-Cualquier cambio en `app/` dispara ambos workflows; basta con que uno de los dos tenga los
-secrets completos para que el despliegue funcione.
+Para desplegar a mano: *Actions → Deploy (GHCR + Ansible) → Run workflow*.
+
+### Deshacer un despliegue
+
+Como la imagen se etiqueta por SHA, un rollback es volver a desplegar una etiqueta anterior:
+
+```bash
+cd ansible
+ansible-playbook node_service.yml --tags app \
+  -e app_image=ghcr.io/tu-usuario/dockerized-service:<sha-anterior>
+```
 
 ---
 
-## 13. Destruir la infraestructura
+## 14. Destruir la infraestructura
 
 Cuando termines, **destruye el Droplet para no seguir pagando**:
 
@@ -585,7 +696,7 @@ terraform apply -replace=digitalocean_ssh_key.this    # forzar recreacion
 
 ---
 
-## 14. Publicar la solución en la comunidad
+## 15. Publicar la solución en la comunidad
 
 Este proyecto forma parte de un reto comunitario: la idea es que otras personas ejecuten tu código
 y te den feedback.
@@ -609,11 +720,16 @@ y te den feedback.
 
 ---
 
-## 15. Buenas prácticas
+## 16. Buenas prácticas
 
 - **El estado es sacred:** versiona el código, nunca edites el `.tfstate` a mano.
 - **Nada de secretos en git:** tokens solo en `terraform.tfvars`, variables de entorno o un
   secret manager. Ya están en `.gitignore`.
+- **Nada de secretos en la imagen:** los secretos viajan en *runtime* (`--env-file`, `env_file`).
+  El `.env` está en `.gitignore` **y** en `.dockerignore`, y el CI lo verifica en cada PR.
+- **Permisos minimos:** el workflow publica con `GITHUB_TOKEN` (`packages: write`) y el
+  servidor descarga con un PAT de **solo lectura**. Nunca compartas el token del runner.
+- **La app falla al arrancar si le faltan secretos**, en lugar de servir rutas rotas.
 - **Empieza siempre por `plan`:** leer el plan es la mejor forma de detectar un `destroy`
   accidental.
 - **Idempotencia:** tanto Terraform como Ansible deben poder repetirse sin efectos raros. Por eso
@@ -621,12 +737,14 @@ y te den feedback.
 - **Versiona el lock file:** `.terraform.lock.hcl` (que sí se versiona) fija las versiones de los
   providers para que todos ejecuten el mismo código.
 - **`terraform fmt` y `validate` en el CI** antes de cualquier `apply`.
+- **Despliega por digest, no por `latest`:** etiquetar por SHA hace el despliegue inmutable y el
+  rollback trivial.
 - **Tags y backups** activados (`droplet_tags`, `droplet_backups`) para saber qué es qué en el
   panel y poder recuperar una instancia.
 
 ---
 
-## 16. Solución de problemas
+## 17. Solución de problemas
 
 | Síntoma | Causa probable | Solución |
 |---------|----------------|----------|
@@ -637,6 +755,12 @@ y te den feedback.
 | `Permission denied (publickey)` | la clave local no coincide con la del Droplet | `ssh -v root@<ip>` y revisa `Offering public key` |
 | `ansible: UNREACHABLE` | IP/host/user mal en el inventario o UFW cortando el 22 | `ansible droplets -m ping`, y abre el 22 **después** de aplicar |
 | `terraform apply` pide el valor de `do_token` | variable sin valor | Exporta `TF_VAR_do_token` o rellena `terraform.tfvars` |
+| `Error: Missing required environment variable(s)` | el contenedor no recibió los secretos | Revisa el `env_file` / `--env` y el `.env` en el servidor (`sudo cat /srv/node-service/.env`) |
+| `docker compose up`: `port is already allocated` | otro servicio (nginx) ocupa el 80 | `sudo systemctl stop nginx`, o pon `app_host_port: 3000` |
+| `docker compose pull`: `denied` / `unauthorized` | el PAT no tiene `read:packages` o la imagen no existe en el registro | Regenera el PAT, y comprueba la etiqueta con `ghcr.io/<user>/<repo>` en la sección *Packages* |
+| `manifest unknown` al desplegar | se desplegó una etiqueta por SHA que no se publicó | El job de deploy debe publicarla antes (usa `deploy.yml`, no el playbook manual) |
+| La imagen local no arranca con `pull access denied` | `pull_policy: always` intenta descargarla de un registro | Para pruebas locales usa `--pull=never` o quita `pull_policy` |
+| `/secret` devuelve `401` con las credenciales correctas | el `.env` del servidor tiene otro `USERNAME`/`PASSWORD` | `sudo cat /srv/node-service/.env` y `docker compose up -d` para aplicarlo |
 
 ---
 
@@ -894,6 +1018,29 @@ ansible-inventory --graph
 ansible droplets -m ping -vvv
 ansible-playbook site.yml --check --diff
 ansible-playbook site.yml --syntax-check
+ansible-playbook node_service.yml --syntax-check
+ansible-playbook node_service.yml --tags app --check --diff
+
+# App Node.js (en app/)
+npm ci
+npm test
+npm run build
+
+# Docker
+docker build -t node-service:local app/                    # construye la imagen
+docker run --rm -p 3000:3000 --env-file app/.env node-service:local
+docker run --rm node-service:local sh -c 'ls -a /app'    # comprueba que NO hay .env
+docker images | grep node-service                            # imagenes construidas
+docker ps --filter name=node-service                         # contenedor en marcha
+docker logs -f node-service                                  # logs del servicio
+docker system df                                             # espacio usado por Docker
+docker system prune -a --volumes                             # limpia imagenes y volumenes
+
+# Comprobar el servicio desplegado
+curl -s http://<IP-DROPLET>/
+curl -s http://<IP-DROPLET>/healthz
+curl -i http://<IP-DROPLET>/secret                                  # 401
+curl -u <usuario>:<password> http://<IP-DROPLET>/secret              # el secreto
 
 # Floci / AWS local
 docker compose -f floci/docker-compose.yml up -d        # levanta el emulador

@@ -1,0 +1,155 @@
+---
+# Workflow reutilizable: compila la app, ejecuta los tests y publica la imagen
+# en el Container Registry de GitHub (ghcr.io).
+#
+# Lo llaman `ci.yml` (sin publicar) y los dos workflows de despliegue.
+#
+# Notas de secrets management:
+#   - El login al registro usa GITHUB_TOKEN, que GitHub emite por workflow, con
+#     el permiso minimo `packages: write`. No hay que guardarlo como secret.
+#   - Los secretos de la aplicacion (SECRET_MESSAGE, USERNAME, PASSWORD) NO se
+#     pasan por aqui: viajan al servidor en tiempo de despliegue y nunca se
+#     hornean en la imagen.
+name: Build and push image
+
+on:
+  workflow_call:
+    inputs:
+      push:
+        description: "Publicar la imagen en el registro"
+        type: boolean
+        default: false
+      extra-tag:
+        description: "Etiqueta adicional para la imagen (vacio = ninguna)"
+        type: string
+        default: ""
+
+jobs:
+  build:
+    name: Test, build and push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+
+      - name: Calcular el nombre de la imagen y las etiquetas
+        id: meta
+        env:
+          EXTRA_TAG: ${{ inputs.extra-tag }}
+          DO_PUSH: ${{ inputs.push }}
+        run: |
+          set -euo pipefail
+          # GHCR exige el nombre del repositorio en minusculas.
+          IMAGE="ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          CI_TAG="${IMAGE}:${GITHUB_SHA::7}"
+          {
+            echo "image=${IMAGE}"
+            echo "ci_tag=${CI_TAG}"
+            # Lista multilinea de etiquetas para docker/build-push-action.
+            echo "tags<<EOF"
+            echo "${CI_TAG}"
+            echo "${IMAGE}:${GITHUB_SHA}"
+            if [ -n "$EXTRA_TAG" ]; then echo "${IMAGE}:${EXTRA_TAG}"; fi
+            if [ "$DO_PUSH" = "true" ]; then echo "${IMAGE}:latest"; fi
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Instalar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      - name: Instalar dependencias
+        working-directory: app
+        run: npm ci
+
+      - name: Ejecutar los tests
+        working-directory: app
+        run: npm test
+
+      - name: Comprobar que .env esta ignorado por git
+        working-directory: app
+        run: |
+          set -euo pipefail
+          if git check-ignore -q .env; then
+            echo "OK: .env esta en .gitignore"
+          else
+            echo "::error::.env NO esta en .gitignore: los secretos podrian subirse al repo"
+            exit 1
+          fi
+
+      - name: Configurar Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Autenticarse en ghcr.io
+        # GITHUB_TOKEN es efimero y lo emite GitHub en cada ejecucion.
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Construir la imagen
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          file: app/Dockerfile
+          push: ${{ inputs.push }}
+          load: ${{ !inputs.push }}
+          tags: ${{ steps.meta.outputs.tags }}
+          build-args: |
+            BUILD_DATE=${{ github.event.repository.updated_at }}
+            VCS_REF=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Requisito explicito del proyecto: .env jamas dentro de la imagen.
+      # Solo se comprueba en el pipeline de CI, donde la imagen queda en el
+      # daemon local y se puede inspeccionar sin publicar nada.
+      - name: Verificar que la imagen no contiene el fichero .env
+        if: ${{ !inputs.push }}
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.meta.outputs.ci_tag }}"
+          echo "Inspeccionando ${IMAGE}"
+          echo "--- contenido de /app ---"
+          docker run --rm --entrypoint sh "$IMAGE" -c 'ls -a /app'
+          echo "--- buscando .env en toda la imagen ---"
+          if docker run --rm --entrypoint sh "$IMAGE" -c 'find / -name ".env*" 2>/dev/null | grep -q .'; then
+            echo "::error::La imagen contiene un fichero .env"
+            exit 1
+          fi
+          echo "OK: la imagen no contiene ningun .env"
+
+      - name: Comprobar que la imagen arranca y responde
+        if: ${{ !inputs.push }}
+        run: |
+          set -euo pipefail
+          IMAGE="${{ steps.meta.outputs.ci_tag }}"
+          # Valores de prueba SOLO para el pipeline: nunca son los secretos reales.
+          docker run -d --name smoke -p 8080:3000 \
+            -e SECRET_MESSAGE=smoke-test -e USERNAME=smoke -e PASSWORD=smoke "$IMAGE"
+
+          for i in $(seq 1 15); do
+            if curl -fsS http://127.0.0.1:8080/ | grep -q "Hello, world!"; then
+              echo "OK: / responde correctamente"
+              break
+            fi
+            sleep 2
+          done
+
+          curl -fsS http://127.0.0.1:8080/ | grep -q "Hello, world!"
+          # /secret debe exigir credenciales: 401 sin ellas y 200 con ellas.
+          code="$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/secret)"
+          [ "$code" = "401" ] || { echo "::error::Se esperaba 401 en /secret, llego ${code}"; exit 1; }
+          curl -fsS -u smoke:smoke http://127.0.0.1:8080/secret | grep -q "smoke-test"
+          echo "OK: /secret protegido con Basic Auth"
+
+          docker rm -f smoke > /dev/null

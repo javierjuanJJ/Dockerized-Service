@@ -10,6 +10,10 @@ const srcDir = path.join(root, 'src');
 const distDir = path.join(root, 'dist');
 
 function gitCommit() {
+  // CI passes BUILD_COMMIT (Dockerfile ARG VCS_REF) because .git is not part of
+  // the build context, so git is unavailable inside the image.
+  if (process.env.BUILD_COMMIT) return process.env.BUILD_COMMIT;
+
   try {
     return execSync('git rev-parse --short HEAD', {
       cwd: root,

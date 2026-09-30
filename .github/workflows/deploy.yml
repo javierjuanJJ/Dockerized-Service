@@ -1,0 +1,200 @@
+---
+# Despliegue principal: publica la imagen en ghcr.io y la despliega en el
+# servidor remoto con Ansible (que instala Docker y hace `docker compose up`).
+#
+# El servidor nunca compila codigo: descarga la imagen ya construida y probada,
+# lo que hace el despliegue rapido, reproducible y reversible (basta con volver
+# a desplegar una etiqueta anterior).
+#
+# Secrets requeridos (Settings -> Secrets and variables -> Actions):
+#   SERVER_HOST        IP publica del Droplet
+#   SERVER_USER        usuario SSH (root en la imagen de DigitalOcean)
+#   SERVER_SSH_KEY     clave privada SSH con acceso al Droplet
+#   GHCR_USERNAME      usuario del PAT de solo lectura sobre el paquete
+#   GHCR_READ_TOKEN    PAT con permiso `read:packages` en el paquete de ghcr.io
+#   APP_SECRET_MESSAGE valor de SECRET_MESSAGE en produccion
+#   APP_USERNAME       usuario de Basic Auth en produccion
+#   APP_PASSWORD       contrasena de Basic Auth en produccion
+#
+# El `environment: production` activa las reglas de proteccion y aprobacion.
+name: Deploy (GHCR + Ansible)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Rama o tag a desplegar"
+        required: false
+        default: "main"
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Construir y publicar la imagen
+    uses: ./.github/workflows/build-push.yml
+    with:
+      push: ${{ github.event_name != 'pull_request' }}
+
+  deploy:
+    name: Desplegar el contenedor en el servidor
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Instalar Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar Ansible
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install ansible-core
+          ansible --version
+
+      - name: Instalar las colecciones de Ansible
+        working-directory: ansible
+        run: ansible-galaxy collection install -r requirements.yml
+
+      - name: Preparar la clave SSH del servidor
+        env:
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          set -euo pipefail
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$SERVER_SSH_KEY" > ~/.ssh/id_deploy_server
+          chmod 600 ~/.ssh/id_deploy_server
+
+      - name: Registrar la host key del servidor
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          touch ~/.ssh/known_hosts
+          # Fijar la host key evita ataques MITM en el despliegue.
+          ssh-keyscan -H "$SERVER_HOST" >> ~/.ssh/known_hosts
+
+      - name: Generar el inventario
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+        run: |
+          set -euo pipefail
+          cat > ansible/inventory.ini <<EOF
+          [app]
+          web-1 ansible_host=${SERVER_HOST} ansible_user=${SERVER_USER} ansible_ssh_private_key_file=~/.ssh/id_deploy_server
+
+          [app:vars]
+          ansible_python_interpreter=/usr/bin/python3
+          EOF
+          cat ansible/inventory.ini
+
+      - name: Calcular la referencia de la imagen
+        id: image
+        run: |
+          set -euo pipefail
+          # Debe coincidir exactamente con la etiqueta publicada por build-push.yml
+          # (mismo nombre en minusculas y mismo sha).
+          IMAGE="ghcr.io/$(echo "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]'):${GITHUB_SHA}"
+          echo "ref=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "Desplegando ${IMAGE}"
+
+      # Los secretos se pasan como variables de entorno y se montan en un JSON
+      # con python, de forma que ningun valor queda literal en la linea de
+      # comandos (y por tanto, en los logs).
+      - name: Preparar las variables de Ansible
+        env:
+          APP_IMAGE: ${{ steps.image.outputs.ref }}
+          APP_SECRET_MESSAGE: ${{ secrets.APP_SECRET_MESSAGE }}
+          APP_USERNAME: ${{ secrets.APP_USERNAME }}
+          APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
+          GHCR_URL: ghcr.io
+          GHCR_USERNAME: ${{ secrets.GHCR_USERNAME }}
+          GHCR_READ_TOKEN: ${{ secrets.GHCR_READ_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.config/ansible
+          python3 - <<'PY'
+          import json, os, pathlib
+
+          required = [
+              "APP_IMAGE", "APP_SECRET_MESSAGE", "APP_USERNAME", "APP_PASSWORD",
+              "GHCR_URL", "GHCR_USERNAME", "GHCR_READ_TOKEN",
+          ]
+          missing = [name for name in required if not os.environ.get(name)]
+          if missing:
+              raise SystemExit(f"Faltan secrets de GitHub Actions: {', '.join(missing)}")
+
+          # A imagen se despliega por digest de commit: es inmutable.
+          vars = {
+              "app_image": os.environ["APP_IMAGE"],
+              "app_env": {
+                  "SECRET_MESSAGE": os.environ["APP_SECRET_MESSAGE"],
+                  "USERNAME": os.environ["APP_USERNAME"],
+                  "PASSWORD": os.environ["APP_PASSWORD"],
+              },
+              "app_registry_url": os.environ["GHCR_URL"],
+              "app_registry_username": os.environ["GHCR_USERNAME"],
+              "app_registry_password": os.environ["GHCR_READ_TOKEN"],
+          }
+          path = pathlib.Path.home() / ".config/ansible/deploy_vars.json"
+          path.write_text(json.dumps(vars))
+          path.chmod(0o600)
+          print("OK: variables de Ansible preparadas (sin imprimir secretos)")
+          PY
+
+      - name: Ejecutar ansible-playbook
+        working-directory: ansible
+        run: |
+          set -euo pipefail
+          ansible-playbook node_service.yml --tags app \
+            -e @~/.config/ansible/deploy_vars.json
+
+      - name: Verificar la aplicacion desplegada
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          APP_USERNAME: ${{ secrets.APP_USERNAME }}
+          APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 6); do
+            if curl -fsS "http://${SERVER_HOST}/" | grep -q "Hello, world!"; then
+              echo "OK: / responde en http://${SERVER_HOST}/"
+              break
+            fi
+            echo "Intento ${i}: la aplicacion aun no responde, reintentando..."
+            sleep 5
+          done
+
+          curl -fsS "http://${SERVER_HOST}/" | grep -q "Hello, world!"
+
+          # /secret debe seguir protegido en produccion.
+          code="$(curl -s -o /dev/null -w '%{http_code}' "http://${SERVER_HOST}/secret")"
+          if [ "$code" != "401" ]; then
+            echo "::error::Se esperaba 401 en /secret sin credenciales, llego ${code}"
+            exit 1
+          fi
+
+          curl -fsS -u "${APP_USERNAME}:${APP_PASSWORD}" "http://${SERVER_HOST}/secret"
+          echo "OK: /secret protegido con Basic Auth en produccion"

@@ -1,0 +1,37 @@
+# Gestionado por Ansible. No editar a mano: los cambios se sobrescriben en el
+# proximo despliegue. Define el COMO se ejecuta el servicio; los secretos viven
+# en el fichero .env referenciado abajo (0600, propiedad de root).
+services:
+  {{ app_compose_project }}:
+    image: {{ app_image }}
+    container_name: {{ app_compose_project }}
+    restart: {{ app_restart_policy }}
+    pull_policy: {{ app_image_pull_policy }}
+
+    env_file:
+      - {{ app_env_file }}
+
+    ports:
+      # El contenedor corre como usuario no-root, por eso escucha en 3000 y el
+      # puerto 80 se publica en el host.
+      - "{{ app_host_port }}:{{ app_container_port }}"
+
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:{{ app_container_port }}{{ app_healthcheck_path }}').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: {{ app_log_max_size }}
+        max-file: "{{ app_log_max_files }}"
+
+    security_opt:
+      - no-new-privileges:true
